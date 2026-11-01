@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <string>
 #include <unordered_set>
@@ -66,6 +67,16 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
         const auto program{static_cast<Tegra::Engines::Maxwell3D::Regs::ShaderType>(index)};
         if (program == Tegra::Engines::Maxwell3D::Regs::ShaderType::Pixel &&
             !maxwell3d->regs.rasterize_enable) {
+            unique_hashes[index] = 0;
+            continue;
+        }
+        if (native && program == Tegra::Engines::Maxwell3D::Regs::ShaderType::Geometry) {
+            // Native geometry programs can't be lowered yet; draw without the stage instead of
+            // skipping the draw (Donkey Kong Bananza's ground is drawn with one).
+            static std::atomic_bool reported{};
+            if (!reported.exchange(true)) {
+                LOG_WARNING(HW_GPU, "Native geometry program ignored; drawing without it");
+            }
             unique_hashes[index] = 0;
             continue;
         }
