@@ -656,6 +656,16 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                      regs.blend.enable[0], seen.size());
         }
     }
+    // A draw of nothing has no effect on the host, but setting it up costs as much as any other.
+    if (static const bool skip_empty = [] {
+            const char* value = std::getenv("EDEN_NX2_SKIP_EMPTY");
+            return value == nullptr || value[0] != '0';
+        }();
+        skip_empty && Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
+        (instance_count == 0 || (is_indexed ? maxwell3d->draw_manager.draw_state.index_buffer.count
+                                            : maxwell3d->draw_manager.draw_state.vertex_buffer.count) == 0)) {
+        return;
+    }
     PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
         const auto& draw_state = maxwell3d->draw_manager.draw_state;
         const u32 num_instances{instance_count};
