@@ -507,6 +507,15 @@ private:
     static constexpr size_t NUM_WRITE_STAMPS = size_t{1} << 12;
     std::array<u64, NUM_WRITE_STAMPS> write_stamps{};
 
+    /// Ranges SynchronizeBuffer found up to date, and the writes seen on their pages by then.
+    struct SyncMemo {
+        DAddr device_addr{};
+        const Buffer* buffer{};
+        u64 stamp{};
+        u32 size{};
+    };
+    std::array<SyncMemo, 256> sync_memos{};
+
     void NoteWrite(DAddr device_addr, u64 size) noexcept {
         const u64 first = device_addr >> WRITE_STAMP_PAGE_BITS;
         const u64 pages = ((device_addr + (std::max<u64>)(size, 1) - 1) >> WRITE_STAMP_PAGE_BITS) - first + 1;

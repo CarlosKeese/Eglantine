@@ -1786,6 +1786,7 @@ BufferId BufferCache<P>::CreateBuffer(DAddr device_addr, u32 wanted_size,
     wanted_size = static_cast<u32>(device_addr_end - device_addr);
     const OverlapResult overlap = ResolveOverlaps(device_addr, wanted_size);
     const u32 size = static_cast<u32>(overlap.end - overlap.begin);
+    NoteWrite(overlap.begin, size);
     const BufferId new_buffer_id =
         slot_buffers.insert(runtime, overlap.begin, size, sparse_compatible);
     auto& new_buffer = slot_buffers[new_buffer_id];
@@ -1846,6 +1847,24 @@ void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
 
 template <class P>
 bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size) {
+    // Asking the memory tracker costs more than it seems for every buffer of every draw: when no
+    // write touched these pages since the last time, the range is still up to date.
+    // EDEN_NX2_SYNC_MEMO=0 always asks it.
+    static const bool sync_memo = [] {
+        const char* value = std::getenv("EDEN_NX2_SYNC_MEMO");
+        return value == nullptr || value[0] != '0';
+    }();
+    constexpr u32 MAX_MEMO_SIZE = 64U << WRITE_STAMP_PAGE_BITS;
+    SyncMemo* memo = nullptr;
+    u64 memo_stamp = 0;
+    if (sync_memo && size <= MAX_MEMO_SIZE) {
+        memo = &sync_memos[((device_addr >> 6) ^ (size >> 4)) & (sync_memos.size() - 1)];
+        memo_stamp = WriteStamp(device_addr, size);
+        if (memo->device_addr == device_addr && memo->size == size && memo->buffer == &buffer &&
+            memo->stamp == memo_stamp) {
+            return true;
+        }
+    }
 #ifdef __ANDROID__
     const bool use_optimized_vertex_buffers = Settings::values.use_optimized_vertex_buffers.GetValue();
 #else
@@ -1876,6 +1895,9 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
             });
             add_upload(upload_start, device_addr_out + range_size);
         });
+        if (memo != nullptr) {
+            *memo = SyncMemo{device_addr, &buffer, memo_stamp, size};
+        }
         if (total_size_bytes == 0) {
             return true;
         }
@@ -2156,6 +2178,7 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     // Mark the whole buffer as CPU written to stop tracking CPU writes
     if (!do_not_mark) {
         Buffer& buffer = slot_buffers[buffer_id];
+        NoteWrite(buffer.CpuAddr(), buffer.SizeBytes());
         memory_tracker.MarkRegionAsCpuModified(buffer.CpuAddr(), buffer.SizeBytes());
     }
 
