@@ -466,6 +466,15 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
                 emit(base(0x5c98000000000000ULL) | (u64{15} << 39) | (u64{insn.Bits(64, 8)} << 20));
                 break;
             }
+            if (insn.Bits(24, 8) == 255 && insn.words[1] == 255 &&
+                (insn.words[2] & ~0x078000ffU) == 0x000e0400) {
+                // IMAD.X Rd, RZ, RZ, Rc, Pn: the high word of a 64-bit add, carry from bits 87-90.
+                mov_imm(252, 1);
+                emit(0x5ca0000000000000ULL | predicate | 251 | (u64{252} << 8) | (u64{255} << 20) |
+                     (u64{insn.Bits(87, 3)} << 39) | (u64{insn.Bits(90, 1)} << 42));
+                emit(base(0x5c10000000000000ULL) | (u64{insn.Bits(64, 8)} << 8) | (u64{251} << 20));
+                break;
+            }
             if ((insn.words[2] & ~0x2ffU) != 0x078e0000 || (insn.words[1] & ~0xffU))
                 return fail(index, "native integer register multiply mode");
             multiply_low(insn.Bits(24, 8), insn.Bits(32, 8), insn.Bits(64, 8), false);
@@ -1001,6 +1010,16 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
             if (insn.words[1] || insn.words[2]) return fail(index, "native NOP mode");
             emit(0x50b0000000000f00ULL | predicate);
             break;
+        case 0x34e: case 0x357:
+            // Operand-less, seen at the start of passthrough geometry programs (Donkey Kong
+            // Bananza's ground). Unidentified; nothing they could produce is read back there.
+            if ((insn.words[0] >> 16) || insn.words[1] || insn.words[2])
+                return fail(index, "unsupported native opcode");
+            break;
+        case 0x923: // ISBERD vertex handle, as Maxwell's default mode
+            if (insn.words[1] || insn.words[2]) return fail(index, "native ISBERD mode");
+            emit(base(0xefd0000000000000ULL) | (u64{insn.Bits(24, 8)} << 8));
+            break;
         case 0x992: { // MEMBAR.SC: preserve workgroup/device visibility.
             const u32 scope = insn.Bits(76, 3);
             if (insn.words[1] || insn.words[2] != (scope << 12) ||
@@ -1193,7 +1212,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
         case 0x919: case 0x9c3: { // S2R / S2UR thread and workgroup identities.
             const u32 special = insn.Bits(72, 8);
             if (insn.words[1] || insn.words[2] != (special << 8) ||
-                (special != 0 && special != 33 && special != 34 && special != 35 &&
+                (special != 0 && special != 29 && special != 33 && special != 34 && special != 35 &&
                  special != 37 && special != 38 && special != 39 &&
                  special != 56 && special != 57 && special != 58 && special != 59 && special != 60))
                 return fail(index, "native special register");
@@ -1330,7 +1349,8 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
             const bool ceil = (mode & ~0x10100U) == 0x0020b000;
             // Bits 75-76 are the destination size (0 = 8-bit), as I2F's source size.
             const bool byte = (mode & ~0x10100U) == 0x0020e000;
-            const bool narrow = small || byte;
+            const bool word = (mode & ~0x10100U) == 0x0020e800; // 16-bit, truncated
+            const bool narrow = small || byte || word;
             if ((!half && !narrow && !floor && !nearest && !ceil && (mode & ~0x100U) != 0x0021f000) ||
                 (opcode != 0xb05 && (insn.words[1] & 0xffffff00U)) ||
                 (opcode == 0xd05 && uniform_register(insn.Bits(32, 8)) == ~0U)) {
@@ -1360,7 +1380,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
                 }
                 source = 250;
             }
-            emit(base(0x5cb0000000000000ULL) | (u64{small ? 1U : byte ? 0U : 2U} << 8) | (u64{2} << 10) |
+            emit(base(0x5cb0000000000000ULL) | (u64{small || word ? 1U : byte ? 0U : 2U} << 8) | (u64{2} << 10) |
                  (u64{is_signed} << 12) | (u64{source} << 20) |
                  (u64{small || nearest ? 0U : floor ? 1U : ceil ? 2U : 3U} << 39) | (u64{insn.Bits(80, 1)} << 44));
             if (!is_signed && !narrow) {
@@ -1882,11 +1902,20 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
                  (u64{insn.Bits(76, 4)} << 48) | (u64{1} << 52) | (u64{insn.Bits(80, 1)} << 55));
             break;
         }
+        case 0x234: // HSETP2, B register: swizzle 60-61, abs 62, neg 63 (Maxwell's 28-31)
         case 0x434: { // HSETP2 with an immediate half pair: A swizzle 74-75 (neg 72, abs 73),
                       // combine 69-70, H_AND 71, compare 76-79, FTZ 80, P/Q 81-86, input 87-90.
-            mov_imm(250, insn.words[1]);
+            u32 b = 250;
+            u64 b_modifiers = 0;
+            if (opcode == 0x234) {
+                if (insn.Bits(40, 20)) return fail(index, "native half comparison operand");
+                b = insn.Bits(32, 8);
+                b_modifiers = u64{insn.Bits(60, 4)} << 28;
+            } else {
+                mov_imm(250, insn.words[1]);
+            }
             emit(0x5d20000000000000ULL | predicate | insn.Bits(84, 3) | (u64{insn.Bits(81, 3)} << 3) |
-                 (u64{insn.Bits(80, 1)} << 6) | (u64{insn.Bits(24, 8)} << 8) | (u64{250} << 20) |
+                 (u64{insn.Bits(80, 1)} << 6) | (u64{insn.Bits(24, 8)} << 8) | (u64{b} << 20) | b_modifiers |
                  (u64{insn.Bits(76, 4)} << 35) | (u64{insn.Bits(87, 3)} << 39) |
                  (u64{insn.Bits(90, 1)} << 42) | (u64{insn.Bits(72, 1)} << 43) |
                  (u64{insn.Bits(73, 1)} << 44) | (u64{insn.Bits(69, 2)} << 45) |
