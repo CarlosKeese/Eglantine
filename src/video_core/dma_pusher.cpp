@@ -159,21 +159,39 @@ bool DmaPusher::Step() {
         std::optional<std::array<CommandHeader, 5>> parameters;
         if (g_nx2_ampere && header.size == 5 && dma_state.method_count == 5 &&
             dma_state.method >= MacroRegistersStart && command_resume_offset == 0) {
-            // The culling pass wrote them on the GPU, earlier in this command stream: let the
-            // split's back catch up (it owns the caches) and download them first.
-            if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-                split.Drain();
-            }
-            if (memory_manager.IsMemoryDirty(header.addr, 5 * sizeof(u32),
-                                             VideoCommon::CacheType::BufferCache)) {
-                memory_manager.FlushRegion(header.addr, 5 * sizeof(u32), VideoCommon::CacheType::BufferCache);
-            }
+            static const bool record_draws = [] {
+                const char* value = std::getenv("EDEN_NX2_RECORD_DRAWS");
+                return value == nullptr || value[0] != '0';
+            }();
+            auto& split = VideoCommon::GpuSplit::Get();
             std::array<u32, 5> words{};
-            memory_manager.ReadBlockUnsafe(header.addr, words.data(), sizeof(words));
+            if (record_draws && split.Active() &&
+                Nx2IndirectRecords::Get().Contains(header.addr)) {
+                // A record the host GPU can read itself, without this thread waiting for it: only
+                // its index count changes, and it comes from the record.
+                split.Defer([rasterizer_ = rasterizer, record = u64{header.addr.Value()}] {
+                    rasterizer_->DrawNextFromRecord(record);
+                });
+                words = {Nx2RecordDrawCount, 1, 0, 0, 0};
+                parameters.emplace();
+            } else {
+                // The culling pass wrote them on the GPU, earlier in this command stream: let the
+                // split's back catch up (it owns the caches) and download them first.
+                if (split.Active()) {
+                    split.Drain();
+                }
+                if (memory_manager.IsMemoryDirty(header.addr, 5 * sizeof(u32),
+                                                 VideoCommon::CacheType::BufferCache)) {
+                    memory_manager.FlushRegion(header.addr, 5 * sizeof(u32),
+                                               VideoCommon::CacheType::BufferCache);
+                }
+                memory_manager.ReadBlockUnsafe(header.addr, words.data(), sizeof(words));
+            }
             // A culling pass writes at most a few thousand indices; anything far beyond that, or
             // first index / base vertex outside any buffer, is memory nobody filled in.
-            if (words[0] > (1U << 20) || words[1] > (1U << 16) || words[2] > (1U << 24) ||
-                (words[3] > (1U << 24) && words[3] < ~0U - (1U << 24))) {
+            if (!parameters && (words[0] > (1U << 20) || words[1] > (1U << 16) ||
+                                words[2] > (1U << 24) ||
+                                (words[3] > (1U << 24) && words[3] < ~0U - (1U << 24)))) {
                 if (static std::atomic<u32> reported{}; reported.fetch_add(1) < 4) {
                     LOG_WARNING(HW_GPU, "Macro {:#x} parameters at {:#x} were never filled in "
                                 "({:08x}); using zeros", dma_state.method, header.addr.Value(),

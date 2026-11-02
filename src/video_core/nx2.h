@@ -9,6 +9,8 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -342,6 +344,44 @@ private:
     std::mutex mutex;
     std::vector<Waiter> waiters;
     std::atomic<size_t> count{};
+};
+
+/// Index count the macro of a draw from an indirect draw record is given: the host GPU reads the
+/// record's own count, this one only tells the rasterizer that the draw is that one.
+inline constexpr u32 Nx2RecordDrawCount = 16381;
+
+/// Title 040074A01BF12000's indirect draw records, seen in its reset program's list recently: they
+/// hold { indices its culling pass counted, 1, 0, 0, 0 }.
+class Nx2IndirectRecords {
+public:
+    static Nx2IndirectRecords& Get() {
+        static Nx2IndirectRecords records;
+        return records;
+    }
+    void Add(std::span<const u64> addresses) {
+        std::scoped_lock lock{mutex};
+        if (last_reset.size() > 1 << 18) {
+            last_reset.clear();
+        }
+        ++generation;
+        for (const u64 address : addresses) {
+            last_reset.insert_or_assign(address, generation);
+        }
+    }
+    bool Contains(u64 address) {
+        std::scoped_lock lock{mutex};
+        const auto it = last_reset.find(address);
+        return it != last_reset.end() && generation - it->second <= 8;
+    }
+    void Clear() {
+        std::scoped_lock lock{mutex};
+        last_reset.clear();
+    }
+
+private:
+    std::mutex mutex;
+    std::unordered_map<u64, u64> last_reset;
+    u64 generation{};
 };
 
 } // namespace Tegra

@@ -15,6 +15,7 @@
 #include <fstream>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 
 #include <fmt/format.h>
 
@@ -31,6 +32,7 @@
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/native_query_trace.h"
+#include "video_core/nx2.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -340,6 +342,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
                 static constexpr std::array<u32, 5> record{0, 1, 0, 0, 0};
                 const std::span<const u8> bytes{reinterpret_cast<const u8*>(record.data()),
                                                 sizeof(record)};
+                Tegra::Nx2IndirectRecords::Get().Add(pointers);
                 u32 written = 0;
                 for (const u64 pointer : pointers) {
                     if (pointer == 0 || !gpu_memory->IsFullyMappedRange(pointer, sizeof(record))) {
@@ -504,8 +507,46 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 }
 } // Anonymous namespace
 
+void RasterizerVulkan::DrawNextFromRecord(u64 record_address) {
+    next_draw_record = record_address;
+}
+
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
+    if (const u64 record = std::exchange(next_draw_record, 0); record != 0 && is_indexed &&
+        maxwell3d->draw_manager.draw_state.index_buffer.count == Tegra::Nx2RecordDrawCount) {
+        // The culling draws wrote the record and the indices in shaders, and these reads aren't
+        // shader reads: a barrier, once per run of culling draws.
+        if (culling_writes_pending) {
+            culling_writes_pending = false;
+            scheduler.RequestOutsideRenderPassOperationContext();
+            scheduler.Record([](vk::CommandBuffer cmdbuf) {
+                static constexpr VkMemoryBarrier barrier{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT,
+                };
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT |
+                                           VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
+                                           VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+                                       0, barrier);
+            });
+        }
+        auto& params = maxwell3d->draw_manager.indirect_state;
+        params.is_byte_count = false;
+        params.is_indexed = true;
+        params.include_count = false;
+        params.count_start_address = 0;
+        params.indirect_start_address = record;
+        params.buffer_size = 5 * sizeof(u32);
+        params.max_draw_counts = 1;
+        params.stride = 5 * sizeof(u32);
+        DrawIndirect();
+        return;
+    }
+    culling_writes_pending |= maxwell3d->regs.IsShaderConfigEnabled(size_t{4});
     TraceWindowTarget(*maxwell3d, *gpu_memory, is_indexed ? "draw-indexed" : "draw",
                       is_indexed ? maxwell3d->draw_manager.draw_state.index_buffer.count
                                  : maxwell3d->draw_manager.draw_state.vertex_buffer.count);
