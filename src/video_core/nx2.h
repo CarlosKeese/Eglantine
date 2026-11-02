@@ -9,6 +9,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -342,6 +343,32 @@ private:
     std::mutex mutex;
     std::vector<Waiter> waiters;
     std::atomic<size_t> count{};
+};
+
+/// Draw parameter blocks a GPU culling pass counts visible indices into (geometry storage buffer
+/// 0, title 040074A01BF12000): the macro that draws from one needs a single instance, which
+/// nothing seen here writes. Other macro draws keep an instance count of 0.
+class Nx2CullingSlots {
+public:
+    static Nx2CullingSlots& Get() {
+        static Nx2CullingSlots slots;
+        return slots;
+    }
+    void Add(u64 gpu_address) {
+        std::scoped_lock lock{mutex};
+        if (addresses.size() > 1 << 16) {
+            addresses.clear();
+        }
+        addresses.insert(gpu_address);
+    }
+    bool Contains(u64 gpu_address) {
+        std::scoped_lock lock{mutex};
+        return addresses.contains(gpu_address);
+    }
+
+private:
+    std::mutex mutex;
+    std::unordered_set<u64> addresses;
 };
 
 } // namespace Tegra

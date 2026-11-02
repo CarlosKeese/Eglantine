@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstdio>
+#include <optional>
 
 #include "common/settings.h"
 #include "core/core.h"
@@ -155,15 +156,45 @@ bool DmaPusher::Step() {
         // holds an allocator pointer or 0, ~0, and taken as parameters it asks for billions of
         // vertices or instances (the macro loops until its step limit, then the host GPU hangs on
         // the draw): draw nothing instead.
-        bool unfilled_parameters = false;
+        std::optional<std::array<CommandHeader, 5>> parameters;
         if (g_nx2_ampere && header.size == 5 && dma_state.method_count == 5 &&
             dma_state.method >= MacroRegistersStart && command_resume_offset == 0) {
-            std::array<u32, 2> words{};
+            // The culling pass wrote them on the GPU, earlier in this command stream: let the
+            // split's back catch up (it owns the caches) and download them first.
+            if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+                split.Drain();
+            }
+            if (memory_manager.IsMemoryDirty(header.addr, 5 * sizeof(u32),
+                                             VideoCommon::CacheType::BufferCache)) {
+                memory_manager.FlushRegion(header.addr, 5 * sizeof(u32), VideoCommon::CacheType::BufferCache);
+            }
+            std::array<u32, 5> words{};
             memory_manager.ReadBlockUnsafe(header.addr, words.data(), sizeof(words));
-            unfilled_parameters = words[0] > (1U << 28) || words[1] > (1U << 24);
-            if (static std::atomic<u32> reported{}; unfilled_parameters && reported.fetch_add(1) < 4) {
-                LOG_WARNING(HW_GPU, "Macro {:#x} parameters at {:#x} were never filled in ({:08x}); "
-                            "using zeros", dma_state.method, header.addr.Value(), fmt::join(words, " "));
+            // A culling pass writes at most a few thousand indices; anything far beyond that, or
+            // first index / base vertex outside any buffer, is memory nobody filled in.
+            if (words[0] > (1U << 20) || words[1] > (1U << 16) || words[2] > (1U << 24) ||
+                (words[3] > (1U << 24) && words[3] < ~0U - (1U << 24))) {
+                if (static std::atomic<u32> reported{}; reported.fetch_add(1) < 4) {
+                    LOG_WARNING(HW_GPU, "Macro {:#x} parameters at {:#x} were never filled in "
+                                "({:08x}); using zeros", dma_state.method, header.addr.Value(),
+                                fmt::join(words, " "));
+                }
+                words.fill(0);
+                parameters.emplace();
+            } else if (words[0] != 0 && words[1] == 0 &&
+                       Tegra::Nx2CullingSlots::Get().Contains(header.addr)) {
+                // The culling pass counts the visible indices into the first word, but nothing
+                // seen here sets the instance count: draw one instance (the ground is black otherwise).
+                words[1] = 1;
+                if (words[4] > (1U << 24)) {
+                    words[4] = 0;
+                }
+                parameters.emplace();
+            }
+            if (parameters) {
+                for (size_t i = 0; i < words.size(); ++i) {
+                    (*parameters)[i].argument = words[i];
+                }
             }
         }
         // A resumed entry is read again: the words after the acquire may be new by now.
@@ -171,10 +202,9 @@ bool DmaPusher::Step() {
         // (the split only starts with unsafe reads; the settings can change mid-game).
         const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
                               (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
-        if (unfilled_parameters) {
-            static const std::array<CommandHeader, 5> zeros{};
-            RecordParsedEntry(header, zeros);
-            command_resume_offset += ProcessCommands(zeros, 0);
+        if (parameters) {
+            RecordParsedEntry(header, *parameters);
+            command_resume_offset += ProcessCommands(*parameters, 0);
         } else if (use_safe) {
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};

@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include "video_core/nx2.h"
+
 #include <algorithm>
 #include <memory>
 #include <numeric>
@@ -506,6 +508,9 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
     const GPUVAddr ssbo_addr = cbufs.const_buffers[cbuf_index].address + cbuf_offset;
     channel_state->storage_buffers[stage][ssbo_index] =
         StorageBufferBinding(ssbo_addr, cbuf_index, is_written);
+    if (stage == 3 && ssbo_index == 0 && is_written) {
+        Tegra::Nx2CullingSlots::Get().Add(channel_state->storage_buffers[stage][ssbo_index].gpu_addr);
+    }
     return (channel_state->storage_buffers[stage][ssbo_index].buffer_id != NULL_BUFFER_ID);
 }
 
