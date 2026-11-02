@@ -237,12 +237,6 @@ public:
     std::vector<ParkedMethod> parked_methods;
     GPUVAddr split_method_end{}; ///< End of the last entry that ended inside a method
 
-    // GPU-culled draw parameters downloaded for this command list (see Step).
-    static constexpr u64 CullingFlushSize = 2ULL << 20;
-    const CommandList* culling_flush_list{};
-    size_t culling_flush_size{};
-    GPUVAddr culling_flush_start{};
-
     std::array<Engines::EngineInterface*, max_subchannels> subchannels{};
     std::array<Engines::EngineTypes, max_subchannels> subchannel_type;
 

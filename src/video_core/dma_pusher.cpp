@@ -160,23 +160,13 @@ bool DmaPusher::Step() {
         if (g_nx2_ampere && header.size == 5 && dma_state.method_count == 5 &&
             dma_state.method >= MacroRegistersStart && command_resume_offset == 0) {
             // The culling pass wrote them on the GPU, earlier in this command stream: let the
-            // split's back catch up (it owns the caches) and download them first. The game culls
-            // everything before it draws, and its blocks share a ring: one wait and download of
-            // the ring's neighbourhood per command list instead of one per block.
-            const auto& list = dma_pushbuffer.front();
-            if (&list != culling_flush_list || list.command_lists.size() != culling_flush_size ||
-                header.addr < culling_flush_start || header.addr >= culling_flush_start + CullingFlushSize) {
-                culling_flush_list = &list;
-                culling_flush_size = list.command_lists.size();
-                culling_flush_start = (header.addr & ~GPUVAddr{CullingFlushSize / 2 - 1}) - CullingFlushSize / 4;
-                if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-                    split.Drain();
-                }
-                if (memory_manager.IsMemoryDirty(culling_flush_start, CullingFlushSize,
-                                                 VideoCommon::CacheType::BufferCache)) {
-                    memory_manager.FlushRegion(culling_flush_start, CullingFlushSize,
-                                               VideoCommon::CacheType::BufferCache);
-                }
+            // split's back catch up (it owns the caches) and download them first.
+            if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+                split.Drain();
+            }
+            if (memory_manager.IsMemoryDirty(header.addr, 5 * sizeof(u32),
+                                             VideoCommon::CacheType::BufferCache)) {
+                memory_manager.FlushRegion(header.addr, 5 * sizeof(u32), VideoCommon::CacheType::BufferCache);
             }
             std::array<u32, 5> words{};
             memory_manager.ReadBlockUnsafe(header.addr, words.data(), sizeof(words));
