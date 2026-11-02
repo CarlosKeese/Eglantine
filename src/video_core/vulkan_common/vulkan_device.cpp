@@ -29,6 +29,7 @@
 #include "common/settings_enums.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
+#include "video_core/vulkan_common/vulkan_checkpoints.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
@@ -737,6 +738,10 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         descriptor_indexing.runtimeDescriptorArray = false;
     }
 
+    if (extensions.device_diagnostic_checkpoints && !Checkpoints::Enabled()) {
+        RemoveExtension(extensions.device_diagnostic_checkpoints,
+                        VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+    }
     // EDEN_NX2_NO_DESCRIPTOR_BUFFER: without descriptor buffers (and so buffer device addresses),
     // for frame captures RenderDoc can replay.
     if (extensions.descriptor_buffer && std::getenv("EDEN_NX2_NO_DESCRIPTOR_BUFFER")) {
@@ -930,6 +935,17 @@ VkFormat Device::GetSupportedFormat(VkFormat wanted_format, VkFormatFeatureFlags
 
 void Device::ReportLoss() const {
     LOG_CRITICAL(Render_Vulkan, "Device loss occurred!");
+    for (const VkCheckpointDataNV& data : graphics_queue.GetCheckpointData()) {
+        const u64 id = reinterpret_cast<u64>(data.pCheckpointMarker);
+        if (const auto* entry = Checkpoints::Find(id)) {
+            LOG_CRITICAL(Render_Vulkan, "Last checkpoint at stage {:#x}: #{} {} programs {:#x} {:#x}, "
+                         "count {}, instances {}", static_cast<u32>(data.stage), id, entry->kind,
+                         entry->program_a, entry->program_b, entry->count, entry->instances);
+        } else {
+            LOG_CRITICAL(Render_Vulkan, "Last checkpoint at stage {:#x}: #{} (no longer recorded)",
+                         static_cast<u32>(data.stage), id);
+        }
+    }
 
     // Wait for the log to flush and for Nsight Aftermath to dump the results
     std::this_thread::sleep_for(std::chrono::seconds{15});

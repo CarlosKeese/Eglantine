@@ -26,6 +26,7 @@
 #include "common/settings.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/dma_pusher.h"
+#include "video_core/vulkan_common/vulkan_checkpoints.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/native_query_trace.h"
@@ -559,6 +560,18 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
             }
             return;
         }
+        if (Vulkan::Checkpoints::DrawsEnabled()) {
+            const auto& regs = maxwell3d->regs;
+            const auto program = [&](size_t index) {
+                return (u64{regs.pipelines[index].reserved[0] & 0xff} << 32) | regs.pipelines[index].reserved[1];
+            };
+            const u64 id = Vulkan::Checkpoints::Add(draw_params.is_indexed ? "draw-indexed" : "draw",
+                                                    program(1), program(5), draw_params.num_vertices,
+                                                    draw_params.num_instances);
+            scheduler.Record([id](vk::CommandBuffer cmdbuf) {
+                cmdbuf.SetCheckpointNV(reinterpret_cast<const void*>(id));
+            });
+        }
 
         scheduler.Record([draw_params](vk::CommandBuffer cmdbuf) {
             if (draw_params.is_indexed) {
@@ -598,6 +611,13 @@ void RasterizerVulkan::DrawIndirect() {
                 LOG_ERROR(Render_Vulkan, "Indirect draw with up to {} draws (stride {}, count buffer {})",
                           params.max_draw_counts, params.stride, params.include_count);
             }
+        }
+        if (Vulkan::Checkpoints::DrawsEnabled()) {
+            const u64 id = Vulkan::Checkpoints::Add("draw-indirect", 0, 0,
+                                                    static_cast<u32>(params.max_draw_counts), 0);
+            scheduler.Record([id](vk::CommandBuffer cmdbuf) {
+                cmdbuf.SetCheckpointNV(reinterpret_cast<const void*>(id));
+            });
         }
         const auto indirect_buffer = buffer_cache.GetDrawIndirectBuffer();
         const auto& buffer = indirect_buffer.first;
@@ -912,6 +932,15 @@ void RasterizerVulkan::DispatchCompute() {
     }
 
     const auto& qmd{kepler_compute->launch_description};
+    if (Vulkan::Checkpoints::Enabled()) {
+        const u64 id = Vulkan::Checkpoints::Add(
+            "dispatch", kepler_compute->regs.code_loc.Address() + qmd.program_start, 0,
+            qmd.grid_dim_x * qmd.grid_dim_y * qmd.grid_dim_z, 1);
+        scheduler.RequestOutsideRenderPassOperationContext();
+        scheduler.Record([id](vk::CommandBuffer cmdbuf) {
+            cmdbuf.SetCheckpointNV(reinterpret_cast<const void*>(id));
+        });
+    }
     auto indirect_address = kepler_compute->GetIndirectComputeAddress();
     if (indirect_address) {
         // DispatchIndirect
