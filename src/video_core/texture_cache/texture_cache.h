@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <cstdlib>
+
 #include <algorithm>
 #include <numeric>
 #include <cstdlib>
@@ -34,6 +36,15 @@
 #include "video_core/textures/decoders.h"
 
 namespace VideoCommon {
+
+/// EDEN_NX2_DESC_MEMO=0 reads the descriptors for every draw.
+inline bool DescriptorMemoEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_DESC_MEMO");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
 
 using Tegra::Texture::TICEntry;
 using Tegra::Texture::TSCEntry;
@@ -446,20 +457,54 @@ typename P::Sampler* TextureCache<P>::GetSampler(u32 index, bool compute) {
 }
 
 template <class P>
+void TextureCache<P>::UpdateDescriptorPoolRanges() {
+    const auto range = [this](const auto& table) {
+        constexpr u64 DESCRIPTOR_SIZE = 32;
+        const auto device_addr = gpu_memory->GpuToCpuAddress(table.current_gpu_addr);
+        const DAddr begin = device_addr.value_or(0);
+        return std::pair<DAddr, DAddr>{begin, device_addr ? begin + (u64{table.current_limit} + 1) * DESCRIPTOR_SIZE : 0};
+    };
+    descriptor_pool_ranges[0] = range(channel_state->graphics_image_table);
+    descriptor_pool_ranges[1] = range(channel_state->graphics_sampler_table);
+}
+
+template <class P>
+void TextureCache<P>::CheckDescriptorMemoChannel() {
+    if (descriptor_memo_channel != channel_state) {
+        descriptor_memo_channel = channel_state;
+        ++descriptor_memo_serial;
+        UpdateDescriptorPoolRanges();
+    }
+}
+
+template <class P>
 SamplerId TextureCache<P>::GetSamplerId(u32 index, bool compute) {
     auto& table = compute ? channel_state->compute_sampler_table : channel_state->graphics_sampler_table;
     if (index > table.current_limit) {
         LOG_DEBUG(HW_GPU, "Invalid sampler index={}", index);
         return NULL_SAMPLER_ID;
     }
+    const bool use_memo = !compute && DescriptorMemoEnabled();
+    DescriptorMemo& memo = sampler_memo[index & (sampler_memo.size() - 1)];
+    if (use_memo) {
+        CheckDescriptorMemoChannel();
+        if (memo.index == index && memo.serial == descriptor_memo_serial) {
+            return SamplerId{memo.id};
+        }
+    }
     auto const map_index = index | (compute ? Common::SlotId::TAGGED_VALUE : 0);
     auto const [descriptor, is_new] = table.Read(*gpu_memory, index);
+    SamplerId result;
     if (is_new) {
-        auto const id = FindSampler(descriptor, compute);
-        channel_state->sampler_ids.insert_or_assign(map_index, id);
-        return id;
+        result = FindSampler(descriptor, compute);
+        channel_state->sampler_ids.insert_or_assign(map_index, result);
+    } else {
+        result = channel_state->sampler_ids.find(map_index)->second;
     }
-    return channel_state->sampler_ids.find(map_index)->second;
+    if (use_memo) {
+        memo = DescriptorMemo{index, result, descriptor_memo_serial};
+    }
+    return result;
 }
 
 template <class P>
@@ -497,6 +542,8 @@ void TextureCache<P>::SynchronizeDescriptors(bool compute) {
             bindings_changed = true;
         if (bindings_changed) {
             ++texture_bindings_serial;
+            ++descriptor_memo_serial;
+            UpdateDescriptorPoolRanges();
         }
     }
 }
@@ -682,9 +729,22 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
         LOG_DEBUG(HW_GPU, "Invalid image view index={}", index);
         return NULL_IMAGE_VIEW_ID;
     }
+    const bool use_memo = !compute && DescriptorMemoEnabled();
+    DescriptorMemo& memo = image_view_memo[index & (image_view_memo.size() - 1)];
+    if (use_memo) {
+        CheckDescriptorMemoChannel();
+        if (memo.index == index && memo.serial == descriptor_memo_serial) {
+            const ImageViewId id{memo.id};
+            if (id != NULL_IMAGE_VIEW_ID) {
+                PrepareImageView(id, false, false);
+            }
+            return id;
+        }
+    }
     auto const map_index = index | (compute ? Common::SlotId::TAGGED_VALUE : 0);
     // Is new (on the tegra engine side)?
     auto const [descriptor, is_new] = table.Read(*gpu_memory, index);
+    ImageViewId result;
     if (is_new) {
         if (IsValidEntry(*gpu_memory, descriptor)) {
             // Is new (registered view) on the texture cache side?
@@ -693,15 +753,22 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
                 pair->second = CreateImageView(descriptor);
             PrepareImageView(pair->second, false, false);
             channel_state->image_view_ids.insert_or_assign(map_index, pair->second);
-            return pair->second;
+            result = pair->second;
+        } else {
+            channel_state->image_view_ids.insert_or_assign(map_index, NULL_IMAGE_VIEW_ID);
+            result = NULL_IMAGE_VIEW_ID;
         }
-        channel_state->image_view_ids.insert_or_assign(map_index, NULL_IMAGE_VIEW_ID);
-        return NULL_IMAGE_VIEW_ID;
+    } else {
+        auto const it = channel_state->image_view_ids.find(map_index);
+        if (it->second != NULL_IMAGE_VIEW_ID)
+            PrepareImageView(it->second, false, false);
+        result = it->second;
     }
-    auto const it = channel_state->image_view_ids.find(map_index);
-    if (it->second != NULL_IMAGE_VIEW_ID)
-        PrepareImageView(it->second, false, false);
-    return it->second;
+    if (use_memo) {
+        // CreateImageView may have deleted images, which already moved the serial on.
+        memo = DescriptorMemo{index, result, descriptor_memo_serial};
+    }
+    return result;
 }
 
 template <class P>
@@ -723,6 +790,12 @@ FramebufferId TextureCache<P>::GetFramebufferId(const RenderTargets& key) {
 
 template <class P>
 void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
+    for (const auto& [pool_begin, pool_end] : descriptor_pool_ranges) {
+        if (cpu_addr < pool_end && pool_begin < cpu_addr + size) {
+            ++descriptor_memo_serial;
+            break;
+        }
+    }
     ForEachImageInRegion(cpu_addr, size, [this, cpu_addr, size](ImageId image_id, Image& image) {
         if (True(image.flags & ImageFlagBits::UnwrittenSparse)) {
             // Written at last: a backed image replaces it where it is used next.
@@ -1798,6 +1871,7 @@ void TextureCache<P>::InvalidateScale(Image& image) {
         channel_info.compute_image_table.Invalidate();
     }
     has_deleted_images = true;
+    ++descriptor_memo_serial;
 }
 
 template <class P>
@@ -2992,6 +3066,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         channel_info.compute_image_table.Invalidate();
     }
     has_deleted_images = true;
+    ++descriptor_memo_serial;
 }
 
 template <class P>

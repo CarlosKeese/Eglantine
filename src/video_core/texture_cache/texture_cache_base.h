@@ -224,6 +224,11 @@ public:
     /// Mark an image as modified from the GPU
     void MarkModification(ImageId id) noexcept;
 
+    /// A new command list starts: descriptors have to be read from memory again.
+    void NewDescriptorEpoch() {
+        ++descriptor_memo_serial;
+    }
+
     /// Fill image_view_ids with the graphics/compute images in indices
     void FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist = true);
 
@@ -501,6 +506,22 @@ private:
     std::array<ImageId, 8> rt_image_id{};
     ImageId rt_depth_image_id{};
     u64 texture_bindings_serial = 0;
+
+    /// Graphics descriptors already read from memory in this command list. A pool isn't rewritten
+    /// between the draws of a list, unless a write the cache sees lands on it.
+    struct DescriptorMemo {
+        u32 index{~0U};
+        Common::SlotId id{};
+        u64 serial{};
+    };
+    std::array<DescriptorMemo, 256> image_view_memo{};
+    std::array<DescriptorMemo, 256> sampler_memo{};
+    std::array<std::pair<DAddr, DAddr>, 2> descriptor_pool_ranges{};
+    const void* descriptor_memo_channel{};
+    u64 descriptor_memo_serial{1};
+
+    void CheckDescriptorMemoChannel();
+    void UpdateDescriptorPoolRanges();
     u64 last_feedback_loop_serial = 0;
     u64 last_feedback_texture_serial = 0;
     bool last_feedback_loop_result = false;

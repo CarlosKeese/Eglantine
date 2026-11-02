@@ -1373,6 +1373,10 @@ void RasterizerVulkan::TiledCacheBarrier() {
 }
 
 void RasterizerVulkan::FlushCommands() {
+    {
+        std::scoped_lock lock{texture_cache.mutex};
+        texture_cache.NewDescriptorEpoch();
+    }
     if (draw_counter == 0) {
         return;
     }
