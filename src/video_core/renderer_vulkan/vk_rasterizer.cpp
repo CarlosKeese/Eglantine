@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <memory>
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +25,7 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/dma_pusher.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/native_query_trace.h"
@@ -540,6 +542,23 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         const auto& draw_state = maxwell3d->draw_manager.draw_state;
         const u32 num_instances{instance_count};
         const DrawParams draw_params{MakeDrawParams(draw_state, num_instances, is_indexed)};
+        // A count no real draw uses (garbage parameters) would keep the host GPU busy until the
+        // driver resets it: skip the draw instead.
+        if (draw_params.num_instances > (1U << 24) || draw_params.num_vertices > (1U << 28)) {
+            static std::atomic<u32> reported{};
+            const u32 count = reported.fetch_add(1);
+            if (count < 16) {
+                LOG_ERROR(Render_Vulkan, "Skipping draw with {} vertices, {} instances ({}indexed)",
+                          draw_params.num_vertices, draw_params.num_instances,
+                          draw_params.is_indexed ? "" : "not ");
+            }
+            if (count == 0) {
+                if (auto* const pusher = Tegra::DmaPusher::Current()) {
+                    pusher->DumpCurrentEntry("absurd draw");
+                }
+            }
+            return;
+        }
 
         scheduler.Record([draw_params](vk::CommandBuffer cmdbuf) {
             if (draw_params.is_indexed) {
@@ -573,6 +592,13 @@ void RasterizerVulkan::DrawIndirect() {
     const auto& params = maxwell3d->draw_manager.indirect_state;
     buffer_cache.SetDrawIndirect(&params);
     PrepareDraw(params.is_indexed, [this, &params] {
+        if (params.max_draw_counts > (1U << 16)) {
+            static std::atomic<u32> reported{};
+            if (reported.fetch_add(1) < 16) {
+                LOG_ERROR(Render_Vulkan, "Indirect draw with up to {} draws (stride {}, count buffer {})",
+                          params.max_draw_counts, params.stride, params.include_count);
+            }
+        }
         const auto indirect_buffer = buffer_cache.GetDrawIndirectBuffer();
         const auto& buffer = indirect_buffer.first;
         const auto& offset = indirect_buffer.second;

@@ -63,6 +63,7 @@ bool DmaPusher::Step() {
     if (!ib_enable || dma_pushbuffer.empty()) {
         return false;
     }
+    Current() = this;
     if (!puller.ResumeAcquire(*this)) {
         return false;
     }
@@ -123,8 +124,9 @@ bool DmaPusher::Step() {
         if (command_resume_offset == 0) {
             // A method's data continues across GP entries, whatever their level: title 4 ends a
             // main entry after a macro's first word and supplies the remaining parameters in a
-            // 5-word subroutine entry. EDEN_NX2_PARK_SPLIT_METHODS restores the old guess (an
-            // entry elsewhere is a call that starts clean; resume where the split one ended).
+            // 5-word subroutine entry (see ResolveSplitMethod). EDEN_NX2_PARK_SPLIT_METHODS
+            // restores the old guess (any entry elsewhere is a call that starts clean; resume
+            // where the split one ended).
             static const bool park_split_methods = std::getenv("EDEN_NX2_PARK_SPLIT_METHODS") != nullptr;
             if (g_nx2_ampere) {
                 if (static u32 split_logs{}; dma_state.method_count != 0 && split_logs < 64) {
@@ -142,12 +144,26 @@ bool DmaPusher::Step() {
                     LOG_DEBUG(HW_GPU, "  previous entry ends {:08x}; next entry starts {:08x}",
                               fmt::join(prev_words, " "), fmt::join(next_words, " "));
                 }
-                if (park_split_methods) {
-                    ResolveSplitMethod(header.addr);
-                }
+                ResolveSplitMethod(header.addr, header.size, park_split_methods);
             }
             if (dma_pushbuffer_subindex < command_list.submit_hashes.size()) {
                 CheckSubmitHash(header, command_list.submit_hashes[dma_pushbuffer_subindex]);
+            }
+        }
+        // Title 040074A01BF12000 passes a draw macro's last 5 parameters (vertex count, instance
+        // count, ...) in their own entry, which its GPU culling pass fills in. One it hasn't filled
+        // holds an allocator pointer or 0, ~0, and taken as parameters it asks for billions of
+        // vertices or instances (the macro loops until its step limit, then the host GPU hangs on
+        // the draw): draw nothing instead.
+        bool unfilled_parameters = false;
+        if (g_nx2_ampere && header.size == 5 && dma_state.method_count == 5 &&
+            dma_state.method >= MacroRegistersStart && command_resume_offset == 0) {
+            std::array<u32, 2> words{};
+            memory_manager.ReadBlockUnsafe(header.addr, words.data(), sizeof(words));
+            unfilled_parameters = words[0] > (1U << 28) || words[1] > (1U << 24);
+            if (static std::atomic<u32> reported{}; unfilled_parameters && reported.fetch_add(1) < 4) {
+                LOG_WARNING(HW_GPU, "Macro {:#x} parameters at {:#x} were never filled in ({:08x}); "
+                            "using zeros", dma_state.method, header.addr.Value(), fmt::join(words, " "));
             }
         }
         // A resumed entry is read again: the words after the acquire may be new by now.
@@ -155,7 +171,11 @@ bool DmaPusher::Step() {
         // (the split only starts with unsafe reads; the settings can change mid-game).
         const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
                               (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
-        if (use_safe) {
+        if (unfilled_parameters) {
+            static const std::array<CommandHeader, 5> zeros{};
+            RecordParsedEntry(header, zeros);
+            command_resume_offset += ProcessCommands(zeros, 0);
+        } else if (use_safe) {
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);
@@ -275,7 +295,15 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
 // buffer (e.g. a compute dispatch) before the entry that carries the rest, which starts right
 // where the first one ended. An entry starting anywhere else is such a call: run it with a clean
 // method state and resume the unfinished method when the stream continues at that address.
-void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address) {
+void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address, u64 entry_size, bool park_always) {
+    // An entry elsewhere holding exactly the words the split method still needs carries its
+    // data (title 4's and title 040074A01BF12000's macro parameters). Any other entry elsewhere
+    // starts clean, and the method resumes where it was split (040074A01BF12000 interleaves
+    // whole entries between the halves of a viewport method).
+    if (!park_always && dma_state.method_count != 0 && entry_address != split_method_end &&
+        entry_size == dma_state.method_count) {
+        return;
+    }
     const auto continued = std::ranges::find(parked_methods, entry_address,
                                              &ParkedMethod::resume_address);
     std::optional<ParkedMethod> resume;
@@ -371,6 +399,7 @@ void DmaPusher::CallMethod(u32 argument) {
                 if (type == Engines::EngineTypes::Maxwell3D) {
                     auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannel);
                     if (maxwell3d->GetNativeMacroEngine().native_turing) {
+                        maxwell3d->front_segment = segment;
                         maxwell3d->FrontCallMethod(system, split, dma_state.method, argument,
                                                    dma_state.is_last_call);
                         return;
@@ -421,6 +450,7 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
                 if (type == Engines::EngineTypes::Maxwell3D) {
                     auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannel);
                     if (maxwell3d->GetNativeMacroEngine().native_turing) {
+                        maxwell3d->front_segment = segment;
                         maxwell3d->FrontCallMultiMethod(system, split, dma_state.method, base_start,
                                                         num_methods, dma_state.method_count);
                         return;
