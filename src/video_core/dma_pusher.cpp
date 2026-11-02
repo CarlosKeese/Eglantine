@@ -151,11 +151,11 @@ bool DmaPusher::Step() {
                 CheckSubmitHash(header, command_list.submit_hashes[dma_pushbuffer_subindex]);
             }
         }
-        // Title 040074A01BF12000 passes a draw macro's last 5 parameters (vertex count, instance
-        // count, ...) in their own entry, which its GPU culling pass fills in. One it hasn't filled
-        // holds an allocator pointer or 0, ~0, and taken as parameters it asks for billions of
-        // vertices or instances (the macro loops until its step limit, then the host GPU hangs on
-        // the draw): draw nothing instead.
+        // Title 040074A01BF12000 passes a draw macro's last 5 parameters (index count, instance
+        // count, ...) in their own entry: an indirect draw record its GPU culling pass counts
+        // into. One no pass has reset holds an allocator pointer or 0, ~0, and taken as parameters
+        // it asks for billions of indices or instances (the macro loops until its step limit, then
+        // the host GPU hangs on the draw): draw nothing instead.
         std::optional<std::array<CommandHeader, 5>> parameters;
         if (g_nx2_ampere && header.size == 5 && dma_state.method_count == 5 &&
             dma_state.method >= MacroRegistersStart && command_resume_offset == 0) {
@@ -180,15 +180,6 @@ bool DmaPusher::Step() {
                                 fmt::join(words, " "));
                 }
                 words.fill(0);
-                parameters.emplace();
-            } else if (words[0] != 0 && words[1] == 0 &&
-                       Tegra::Nx2CullingSlots::Get().Contains(header.addr)) {
-                // The culling pass counts the visible indices into the first word, but nothing
-                // seen here sets the instance count: draw one instance (the ground is black otherwise).
-                words[1] = 1;
-                if (words[4] > (1U << 24)) {
-                    words[4] = 0;
-                }
                 parameters.emplace();
             }
             if (parameters) {
