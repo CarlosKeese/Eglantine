@@ -501,6 +501,30 @@ private:
 
     void ClearDownload(DAddr base_addr, u64 size);
 
+    /// Writes the buffer cache sees, by device page (hashed): a uniform buffer copy older than
+    /// the writes to its pages may be stale.
+    static constexpr u32 WRITE_STAMP_PAGE_BITS = 12;
+    static constexpr size_t NUM_WRITE_STAMPS = size_t{1} << 12;
+    std::array<u64, NUM_WRITE_STAMPS> write_stamps{};
+
+    void NoteWrite(DAddr device_addr, u64 size) noexcept {
+        const u64 first = device_addr >> WRITE_STAMP_PAGE_BITS;
+        const u64 pages = ((device_addr + (std::max<u64>)(size, 1) - 1) >> WRITE_STAMP_PAGE_BITS) - first + 1;
+        for (u64 i = 0; i < (std::min<u64>)(pages, NUM_WRITE_STAMPS); ++i) {
+            ++write_stamps[(first + i) & (NUM_WRITE_STAMPS - 1)];
+        }
+    }
+
+    [[nodiscard]] u64 WriteStamp(DAddr device_addr, u64 size) const noexcept {
+        const u64 first = device_addr >> WRITE_STAMP_PAGE_BITS;
+        const u64 pages = ((device_addr + (std::max<u64>)(size, 1) - 1) >> WRITE_STAMP_PAGE_BITS) - first + 1;
+        u64 stamp = 0;
+        for (u64 i = 0; i < (std::min<u64>)(pages, NUM_WRITE_STAMPS); ++i) {
+            stamp += write_stamps[(first + i) & (NUM_WRITE_STAMPS - 1)];
+        }
+        return stamp;
+    }
+
     void InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                     std::span<const u8> inlined_buffer);
 

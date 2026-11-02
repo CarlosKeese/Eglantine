@@ -166,6 +166,7 @@ void BufferCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size
 
 template <class P>
 void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size) {
+    NoteWrite(device_addr, size);
     if (IsRegionGpuModified(device_addr, size)) {
         ClearDownload(device_addr, size);
         gpu_modified_ranges.Subtract(device_addr, size);
@@ -243,6 +244,9 @@ void BufferCache<P>::ClearDownload(DAddr device_addr, u64 size) {
 
 template <class P>
 bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount) {
+    if (const auto written = gpu_memory->GpuToCpuAddress(dest_address)) {
+        NoteWrite(*written, amount);
+    }
     const std::optional<DAddr> cpu_src_address = gpu_memory->GpuToCpuAddress(src_address);
     const std::optional<DAddr> cpu_dest_address = gpu_memory->GpuToCpuAddress(dest_address);
     if (!cpu_src_address || !cpu_dest_address) {
@@ -312,6 +316,9 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
 
 template <class P>
 bool BufferCache<P>::DMAClear(GPUVAddr dst_address, u64 amount, u32 value) {
+    if (const auto written = gpu_memory->GpuToCpuAddress(dst_address)) {
+        NoteWrite(*written, amount * sizeof(u32));
+    }
     const std::optional<DAddr> cpu_dst_address = gpu_memory->GpuToCpuAddress(dst_address);
     if (!cpu_dst_address) {
         return false;
@@ -1001,6 +1008,20 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     TouchBuffer(buffer, binding.buffer_id);
     const bool has_host_buffer = binding.buffer_id != NULL_BUFFER_ID;
     const u32 offset = has_host_buffer ? buffer.Offset(device_addr) : 0;
+    // EDEN_NX2_UNIFORM_REUSE=0 copies small uniform buffers for every draw, as before.
+    static const bool uniform_reuse = [] {
+        const char* value = std::getenv("EDEN_NX2_UNIFORM_REUSE");
+        return value == nullptr || value[0] != '0';
+    }();
+    if constexpr (!IS_OPENGL) {
+        if (uniform_reuse && has_host_buffer &&
+            runtime.RebindMappedUniformBuffer(stage, index, device_addr, size,
+                                              WriteStamp(device_addr, size))) {
+            channel_state->fast_bound_uniform_buffers[stage] |= 1u << binding_index;
+            channel_state->uniform_buffer_binding_sizes[stage][binding_index] = size;
+            return;
+        }
+    }
     const bool needs_alignment_stream = [&]() {
         if constexpr (IS_OPENGL) {
             return false;
@@ -1038,6 +1059,10 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         // Stream buffer path to avoid stalling on non-Nvidia drivers or Vulkan
         const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
         device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
+        if constexpr (!IS_OPENGL) {
+            runtime.RememberMappedUniformBuffer(stage, index, device_addr, size,
+                                                WriteStamp(device_addr, size));
+        }
         return;
     }
     // Classic cached path
@@ -1597,6 +1622,7 @@ void BufferCache<P>::UpdateComputeTextureBuffers() {
 
 template <class P>
 void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync) {
+    NoteWrite(device_addr, size);
     if constexpr (!IS_OPENGL) {
         if (needs_sync) {
             Buffer& buffer = slot_buffers[buffer_id];
@@ -1956,6 +1982,7 @@ bool BufferCache<P>::InlineMemory(DAddr dest_address, size_t copy_size,
 template <class P>
 void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                                 std::span<const u8> inlined_buffer) {
+    NoteWrite(dest_address, copy_size);
     ClearDownload(dest_address, copy_size);
     gpu_modified_ranges.Subtract(dest_address, copy_size);
 
