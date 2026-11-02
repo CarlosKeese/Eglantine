@@ -737,6 +737,12 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         descriptor_indexing.runtimeDescriptorArray = false;
     }
 
+    // EDEN_NX2_NO_DESCRIPTOR_BUFFER: without descriptor buffers (and so buffer device addresses),
+    // for frame captures RenderDoc can replay.
+    if (extensions.descriptor_buffer && std::getenv("EDEN_NX2_NO_DESCRIPTOR_BUFFER")) {
+        RemoveExtensionFeature(extensions.descriptor_buffer, features.descriptor_buffer,
+                               VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
+    }
     // VK_EXT_descriptor_buffer requires VK_KHR_buffer_device_address
     if (extensions.descriptor_buffer && !features.buffer_device_address.bufferDeviceAddress) {
         LOG_WARNING(Render_Vulkan, "Descriptor buffer needs buffer device address, disabling.");
