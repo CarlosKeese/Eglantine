@@ -1527,7 +1527,13 @@ private:
         if (!Settings::values.use_speed_limit.GetValue() || Settings::SpeedLimit() == 0) {
             return;
         }
-        const auto interval = std::chrono::nanoseconds{100'000'000'000LL / 60 / Settings::SpeedLimit()};
+        // EDEN_NX2_DK_30FPS (loader/nso.cpp) pins the game to 2 vblanks per frame.
+        static const bool every_second_vblank = [] {
+            const char* const value = std::getenv("EDEN_NX2_DK_30FPS");
+            return value != nullptr && value[0] == '1';
+        }();
+        const auto interval = std::chrono::nanoseconds{
+            100'000'000'000LL / 60 / Settings::SpeedLimit() * (every_second_vblank ? 2 : 1)};
         const auto now = std::chrono::steady_clock::now();
         if (now > m_next_vblank + interval) {
             // Running slower than 60 fps: show at once and don't bank the lost time.
